@@ -10,19 +10,24 @@ import os
 import glob
 import time
 
+
+DEV = False
+if DEV:
+    os.chdir("..")
+
 INDEX = os.path.join(os.getcwd(), "lightning.conf")
 HEAD = "@head"
 REQUIRE = "@require"
 PROVIDE = "@provide"
 
-
+        
 class Source:
-    """Marked portion of a Javascript file that defines something."""
+    """Javascript source file container."""
 
     def __init__(self, path:str):
         """Create a source file container."""
 
-        self.path = path
+        self.path = os.path.abspath(path)
         self.head = False
         self.require = []
         self.provide = []
@@ -77,73 +82,6 @@ class Source:
         return self.code
 
 
-def sep(path:str) -> str:
-    """Fix a path according to the operating system."""
-
-    return path.replace("/", os.sep)
-
-
-def index(path:str=INDEX) -> [str]:
-    """Get the build sources from the index file."""
-
-    files = set()
-    with open(path) as file:
-        for line in file.readlines():
-            if line.startswith("+"):
-                files |= set(glob.glob(sep(line[1:].strip()), recursive=True))
-            elif line.startswith("-"):
-                files -= set(glob.glob(sep(line[1:].strip()), recursive=True))
-    return list(map(os.path.abspath, files))
-
-
-def source(paths:[str]) -> [Source]:
-    """Map a list of paths to a list of sources."""
-
-    return list(map(Source, paths))
-
-
-def find(require, sources):
-    """Find a source that provides a requirement from a list."""
-
-    for source in sources:
-        if require in source.provide:
-            return source
-    return None
-
-
-def sort(sources:[Source]) -> [Source]:
-    """Sort the sources topologically."""
-
-    out = []
-    sources = sources[:]
-    for source in sources:
-        if source.head:
-            sources.remove(source)
-            out.append(source)
-    while sources:
-        cyclic = True
-        for source in sources:
-            for require in source.require:
-                if find(require, sources):
-                    break
-            else:
-                cyclic = False
-                sources.remove(source)
-                out.append(source)
-        if cyclic:
-            raise RuntimeError(
-                "Circular dependencies found in {}.".format(
-                os.path.basename(source.path)))
-    return out
-                
-
-def concatenate(sources:[Source], path:str) -> str:
-    """Concatenate the source list."""
-
-    with open(path, "w") as file:
-        file.write("\n".join(map(lambda s: s.read(), sources)))
-
-
 def common(paths:[str]) -> str:
     """Return the common path of a list with wildcard."""
 
@@ -155,28 +93,142 @@ def common(paths:[str]) -> str:
     return path
 
 
+def find(require, sources):
+    """Find a source that provides a requirement from a list."""
+
+    for source in sources:
+        if require in source.provide:
+            return source
+    return None
+
+
+class Target:
+    """A set of sources defined by an index file."""
+
+    def __init__(self, target:str, include:[str], exclude:[str]):
+        """Initialize a build with its target and source paths."""
+
+        self.target = target
+        self.include = include
+        self.exclude = exclude
+        self.sources = []
+        self.common = common(include)
+
+    def __repr__(self):
+        """Represent the build as a string."""
+
+        return "Target[{}:{}]".format(
+            self.target, os.path.basename(self.common))
+
+    def index(self):
+        """Index the files defined by paths."""
+
+        self.sources.clear()
+        files = set()
+        for path in self.include:
+            files |= set(glob.glob(path, recursive=True))
+        for path in self.exclude:
+            files -= set(glob.glob(path, recursive=True))
+        self.sources.extend(map(Source, files))
+
+    def includes(self, path:str) -> bool:
+        """Check if a source file is in the build include."""
+
+        return (os.path.abspath(path) in
+                tuple(map(lambda s: s.path, self.sources)))
+
+    def sort(self):
+        """Sort the sources topologically."""
+
+        correct = []
+        for source in self.sources:
+            if source.head:
+                self.sources.remove(source)
+                correct.append(source)
+        while self.sources:
+            cyclic = True
+            for source in self.sources:
+                for require in source.require:
+                    if find(require, self.sources):
+                        break
+                else:
+                    cyclic = False
+                    self.sources.remove(source)
+                    correct.append(source)
+            if cyclic:
+                raise RuntimeError(
+                    "Circular dependencies found in {}.".format(
+                    os.path.basename(source.path)))
+        self.sources = correct
+
+    def build(self):
+        """Build and write the concatenated source files."""
+
+        self.index()
+        self.sort()
+        with open(self.target, "w") as file:
+            for source in self.sources:
+                file.write(source.read().rstrip() + "\n\n\n")
+        print("Built", repr(self))
+                    
+
+def sep(path:str) -> str:
+    """Fix a path according to the operating system."""
+
+    return path.replace("/", os.sep)
+        
+
+def index(path:str=INDEX) -> [Target]:
+    """Get the build sources from the index file."""
+
+    out = []
+    with open(path) as file:
+        target = None
+        include = None
+        exclude = None
+        for line in file.readlines():
+            line = line.lstrip()
+            first = line[0]
+            if line == "" or first in "#;":
+                continue
+            elif first in "+-" and target is None:
+                raise SyntaxWarning("Ignoring files not under build target.")
+            elif first == "+":
+                include.append(sep(line[1:].strip()))
+            elif first == "-":
+                exclude.append(sep(line[1:].strip()))
+            else:
+                if include or exclude:
+                    out.append(Target(target, include, exclude))
+                target = line.strip()
+                include = []
+                exclude = []
+        out.append(Target(target, include, exclude))
+    return out
+
+
 class NaiveDeltaHandler(watchdog.events.FileSystemEventHandler):
     """Calls a full sort and concatenate when the filesystem changes."""
 
-    def __init__(self, target:str, index:str=INDEX):
+    def __init__(self, target:[Target]):
         """Initialize the file handler with its config path."""
 
         self.target = target
-        self.index = index
         self.cache = {}
         self.build()
 
     def build(self):
         """Concatenate the source files."""
 
-        sources = sort(source(index(self.index)))
-        concatenate(source, self.target)
-
+        self.target.index()
+        self.target.build()
+            
     def on_any_event(self, event: watchdog.events.FileSystemMovedEvent):
         """Called when any event is fired."""
 
         path = os.path.realpath(event.src_path)
-        if path not in index(self.index):
+        self.target.index()
+        if not self.target.includes(path):
             return
         try:
             mtime = os.path.getmtime(path)
@@ -185,13 +237,19 @@ class NaiveDeltaHandler(watchdog.events.FileSystemEventHandler):
         if self.cache.get(path, 0) >= mtime:
             return
         self.cache[path] = mtime
-        self.build()
+        target.build()
 
 
 if __name__ == "__main__":
     import sys
     observer = watchdog.observers.Observer()
-    observer.schedule(NaiveDeltaHandler(sys.argv[1]))
-
-# TODO: make this work for multiple builds
-# Implement YAML or something, idek
+    for target in index():
+        handler = NaiveDeltaHandler(target)
+        observer.schedule(handler, target.common, recursive=True)
+    observer.start()
+    while True:
+        try:
+            time.sleep(0.5)
+        except KeyboardInterrupt:
+            observer.stop()
+            break
